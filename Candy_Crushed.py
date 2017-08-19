@@ -1,8 +1,6 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-# TODO : Test with a grid that has a different number of rows and cols.
-
 __author__ = 'JeromeJ'
 __website__ = 'http://www.olissea.com/'
 
@@ -14,9 +12,9 @@ print()
 print('Loading the modules can take up to a few seconds...')
 
 from collections import namedtuple
-import enum
+import os
+import pathlib
 import itertools
-import operator
 import time
 import re
 
@@ -24,69 +22,125 @@ import pyscreenshot
 import cv2
 import numpy
 
-import pdb
-
 print('Modules loaded successfuly!')
 print()
 
-catch_all = True
-take_screenshot = False
-display_grid = False
-
 # width, height
-standard_cell = (30, 30)  # Later changed to a StandardCell namedtuple
+standard_cell_size = (30, 30)
 
 candy_book = {
-    'blue':         ('bluecandy',       .7),
-    'green':        ('greencandy',      .8),
-    'orange':       ('orangecandy',     .6),
-    'red':          ('redcandy',        .7),
-    'yellow':       ('yellowcandy',     .85),
-    'purple':       ('purplecandy',     .7),
+    'blue':         ('bluecandy',       70),
+    'green':        ('greencandy',      80),
+    'orange':       ('orangecandy',     60),
+    'red':          ('redcandy',        70),
+    'yellow':       ('yellowcandy',     85),
+    'purple':       ('purplecandy',     70),
     
-    'black':        ('Black',           .7),
-    'multicolor':   ('multicolorcandy', .7),
+    'black':        ('Black',           70),
+    'multicolor':   ('multicolorcandy', 70),
 }
 
-# x,y are synomyms of width, height so they can be obtained using axis.coord_from_axis(standard_cell)
-standard_cell = namedtuple('StandardCell', 'x y width height')(*(standard_cell*2))
+# Valid names:
+# - i   (stands for ignore)
+# - bg  (stands for background)
+# - h_purple (for horizontal stripped purple candy) (v_* for vertical)
+# - l_purple (for locked purple candy)
+# - cherry
+# - nut
+# - ...
 
+new_things = {
+    'i': '?',
+    'bg': ' background',  # Intended white-space at the beginning
+    'cherry': 'Cherry',  # Intended capital
+    'nut': 'Nut',  # Intended capital
+}
+
+special_candy = '(l_)?([hv]_)?(purple|blue|green|yellow|red|orange)'
+
+# ## CONSTANTS ##
+
+RED = (0, 0, 255)
+BLUE = (255, 0, 0)
+
+# ## TOOLS ##
+
+
+def nice_repr(obj):
+    """
+    Decorator to bring namedtuple's __repr__ behavior to regular classes.
+    
+    Source: http://stackoverflow.com/a/41600946/1524913
+    """
+    
+    def _nice_repr(self):
+        v = vars(self)
+        
+        # Prevent infinite looping if `vars` happens to include `self`.
+        del(v['self'])
+        
+        return repr(namedtuple(type(self).__name__, v)(**v))
+
+    obj.__repr__ = _nice_repr
+    obj.__str__ = _nice_repr
+
+    return obj
+
+
+w, h = standard_cell_size
+
+# (x,y) are synonyms of (w, h) so they can be obtained using axis.coord_from_axis(standard_cell)
+standard_cell = namedtuple('StandardCell', 'x y width height w h')(
+    w, h,
+    w, h,
+    w, h
+)
+
+
+@nice_repr
 class Candy:
     # Candy can't be a namedtuple anymore because tuples are immutable
     # and we need to set col, row later on only
-    def __init__(self, type, x, y, col=None, row=None):
-        self.type = re.sub('(.*)candy$', '\\1', type)  # rtrim of "candy"
-        self.x = x
-        self.y = y
-        self.col = col
-        self.row = row
-
-    def __repr__(self):
-        return "Candy(type='{type}', x={x}, y={y}, col={col}, row={row})".format(**vars(self))
-        # return "{name}Candy(x={x}, y={y}, col={col}, row={row})".format(name=self.type.title(), **vars(self))
-
-    __str__ = __repr__
     
-GridItem = namedtuple('GridItem', 'type')
+    # (1) Alternatively: type = re.sub('candy$', '', type)
+    # (2) Same as `self.type = type` and so on.
+    
+    def __init__(self, type, x, y, col=None, row=None):
+        # (1)
+        if type.endswith('candy'):
+            type = type[:-5]
+        
+        # (2)
+        for k, v in vars().items():
+            setattr(self, k, v)
 
-get_x_coord = lambda candy: candy.x
-get_y_coord = lambda candy: candy.y
+
+def get_x_coord(candy):
+    return candy.x
+
+
+def get_y_coord(candy):
+    return candy.y
+
 
 class AllowedKeyboardInterrupt(Exception):
     pass
+
 
 class Grid:
     def __init__(self, candies_pos):
         self.candies_pos = candies_pos
         self.candies = []
-        self._map_candies_to_grid()
+        
+        self._candies2grid()
 
-    def _get_first_colrow(self, get_coord_func, candies) -> iter:
-        lowest_candy_xy = get_coord_func(
-            min(candies, key=get_coord_func)
+    @staticmethod
+    def _get_first_colrow(f_get_coord, candies) -> iter:
+        lowest_candy_xy = f_get_coord(
+            min(candies, key=f_get_coord)
         )
 
-        standard_cell_xy = get_coord_func(standard_cell)
+        standard_cell_xy = f_get_coord(standard_cell)
 
         # Only keep the candies situated between lowest_candy.x and lowest_candy.x + cell_width
         # Respectively, lowest_candy.y and lowest_candy.y + cell_height
@@ -96,15 +150,19 @@ class Grid:
         # x - min(a, b) <= abs(a-b)
 
         # a <= x <= b
-        # good_candies = filter(lambda candy: lowest_candy_xy <= get_coord_func(candy) <= lowest_candy_xy + standard_cell_xy, candies)
+        # good_candies = filter(
+        #   lambda candy: lowest_candy_xy <= f_get_coord(candy) <= lowest_candy_xy + standard_cell_xy, candies
+        # )
 
         # x - min(a-b) <= abs(a-b)
-        good_candies = filter(lambda candy: get_coord_func(candy) - lowest_candy_xy <= standard_cell_xy, candies)
-            
+        good_candies = filter(lambda candy: f_get_coord(candy) - lowest_candy_xy <= standard_cell_xy, candies)
+
         return good_candies
     
-    def _map_candies_to_axis(self, get_coord_func) -> ('candies_axis_index', 'axis_length'):
-        colrow = get_coord_func(Candy('unknown', x='col', y='row'))
+    def _candies2axis(self, f_get_coord):
+        """Returns `(candies_axis_index, axis_length)`."""
+
+        colrow = f_get_coord(Candy('unknown', x='col', y='row'))
         
         candies = self.candies_pos[:]
         candies_axis_index = {}
@@ -118,7 +176,7 @@ class Grid:
             #       self._get_first_colrow returns a filter object linked to candies BUT, in the
             #       loop below, we modify candies while iterating over that linked filter object.
             #   )
-            axis_candies = list(self._get_first_colrow(get_coord_func, candies))
+            axis_candies = list(self._get_first_colrow(f_get_coord, candies))
 
             # Removing the candies found in that col/row from the rest of the candies
             for candy in axis_candies:
@@ -126,22 +184,21 @@ class Grid:
                 candies_axis_index[candy] = axis_index
                 candies.remove(candy)
 
-        return (candies_axis_index, axis_index)
+        return candies_axis_index, axis_index
     
-    def _map_candies_to_grid(self):
+    def _candies2grid(self):
         # Alternatively colrow_length can be calculated with max(colrow_coords.values())
-        col_coords, cols_length = self._map_candies_to_axis(get_x_coord)
-        row_coords, rows_length = self._map_candies_to_axis(get_y_coord)
+        col_coords, cols_length = self._candies2axis(get_x_coord)
+        row_coords, rows_length = self._candies2axis(get_y_coord)
         
         self.candies = [[None]*cols_length for _ in range(rows_length)]
         for candy in self.candies_pos:
             candy_x = row_coords[candy]
             candy_y = col_coords[candy]
-            # self.candies[candy_x][candy_y] = GridItem(candy.type)
             self.candies[candy_x][candy_y] = candy
 
-    def __getitem__(self, slice):
-        return self.candies[slice]
+    def __getitem__(self, slice_obj):
+        return self.candies[slice_obj]
 
     def __iter__(self):
         return iter(self.candies)
@@ -149,7 +206,7 @@ class Grid:
     def __repr__(self):
         return '\n'.join(
             ''.join(
-                candy.type[0] if candy else '?'
+                re.sub('^dynamic/', '', candy.type)[0] if candy else '?'
                 for candy in rows
             )
             for rows in self.candies
@@ -157,19 +214,20 @@ class Grid:
 
 
 # http://stackoverflow.com/questions/14134892/convert-image-from-pil-to-opencv-format
-def PIL2cv(PIL_img):
-    return cv2.cvtColor(numpy.array(PIL_img), cv2.COLOR_RGB2BGR)
+def pil2cv(pil_img):
+    return cv2.cvtColor(numpy.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
-def catch_candy(surface, candy_type, threshold=.7):
-    candy = cv2.imread('candies/{}.png'.format(candy_type))
+def catch_candy(surface, candy_type, threshold=70):
+    threshold /= 100
+
+    candy = cv2.imread('{}{}.png'.format(CANDY_DIR, candy_type))
     
     try:
         # .shape returns (rows, cols, channels)
         w, h, _ = candy.shape
     except AttributeError:
-        # TODO Find a better error
-        raise AttributeError('Invalid argument: can\'t load candies/{}.png'.format(candy_type))
+        raise AttributeError('Invalid argument: can\'t load {}{}.png'.format(CANDY_DIR, candy_type))
 
     candies = cv2.matchTemplate(surface, candy, cv2.TM_CCOEFF_NORMED)
     loc = numpy.where(candies >= threshold)
@@ -189,13 +247,16 @@ def catch_candy(surface, candy_type, threshold=.7):
             valid_candies.append(pt)
 
     candies = map(lambda pt: Candy(candy_type, *pt), valid_candies)
+
     return candies
 
 
 def catch_candies(surface, candy_list):
     candies = []
+
     for name, threshold in candy_list:
         candies.extend(catch_candy(surface, name, threshold))
+
     return candies
 
 
@@ -231,11 +292,13 @@ def show_grid(screenshot, candies):
                 2
             )
 
-    show_screen('The Grid', screenshot)
+    show_screenshot(screenshot, 'The Grid')
 
 
-def highlight_candies(screenshot, candies:(Candy or ('x', 'y')), color=(255, 0, 0)):
-    screenshot = screenshot[:]
+def highlight_candies(screenshot, candies:(Candy or ('x', 'y')), color=BLUE, permanent_ink=False):
+    if not permanent_ink:
+        screenshot = screenshot.copy()
+    
     for candy in candies:
         try:
             x,y = candy.x, candy.y
@@ -243,30 +306,41 @@ def highlight_candies(screenshot, candies:(Candy or ('x', 'y')), color=(255, 0, 
             x,y = candy
         
         cv2.rectangle(
-            screenshot,
-            (x, y),
-            (x + standard_cell.width, y + standard_cell.height),
-            color,
-            2
+            img=screenshot,
+            pt1=(x, y),
+            pt2=(x + standard_cell.width, y + standard_cell.height),
+            color=color,
+            thickness=2
         )
+    
     return screenshot
 
 
-if __name__ == '__main__':
+def main(candy_book:dict, take_screenshot=True, catch_all=True, use_extended_candybook=True):
+    """
+    take_screenshot:        if False, opens a default screenshot.
+    catch_all:              if False, you're prompted to chose which candy to highlight.
+    use_extended_candybook: if True, let the AI try to learn and remember unknown candies. [experimental]
+    """
+
     if take_screenshot:
         input('Ready for the screenshot?')
         time.sleep(1)
         print()
     
-        screenshot = PIL2cv(pyscreenshot.grab())
+        screenshot = pil2cv(pyscreenshot.grab())
     else:
         screenshot = cv2.imread('candy-crush-saga-screenshot-01.jpg')
-
-    # Must never be written over: always copied before used
+    
     blank_screenshot = screenshot.copy()
+
+    if use_extended_candybook:
+        candy_book.update(
+            {name:('dynamic/{}'.format(pathlib.Path(name).stem), 70) for name in os.listdir('{}dynamic/'.format(CANDY_DIR))}
+        )
     
     if catch_all:
-        print('catch_all is ON')
+        print('CATCH_ALL is ON')
         
         candies = catch_candies(screenshot, candy_book.values())
 
@@ -276,91 +350,72 @@ if __name__ == '__main__':
         print()
         
         for y, row in enumerate(grid):
-            #           y-1
-            # (----->)  y
-            #           y+1
-            #
-            # Getting row by row
-            
             for x, candy in enumerate(row):
-                # candy1
-                # ^
-                # |
-                # ----->
-                #  |
-                #  v
-                #  candy2
-                #
-                # Iterating over the cols of that row
-                
                 print(candy)
-                # row = grid[y]  # Already set
-                col = list(zip(*grid))[x]
-                
+
+                # row = grid[y]
+                # candy = grid[y][x]
+
+                # Unknown type of candy
                 if candy is None:
+                    # zip(*grid) swaps cols and rows
+                    col = list(zip(*grid))[x]
+
+                    # Estimate the x,y of the unknown candy by taking the x from the col and y from the row
+                    # As defined by any of its valid candy `list(filter(None, col))` (guaranteed to have at least 1)
                     unknown_x = list(filter(None, col))[0].x
                     unknown_y = list(filter(None, row))[0].y
-                    # No need to take the most top/left
-                    # min(list(filter(None, col)), key=get_x_coord).x,  # Get the most left x coord on current col
-                    # min(list(filter(None, row)), key=get_y_coord).y,  # Get the most top y coord on current row
                     
                     show_screenshot(
                         highlight_candies(
-                            blank_screenshot.copy(),
+                            blank_screenshot,
                             [(unknown_x, unknown_y)],
-                            (0,0,255)
+                            RED
                         )
                     )
 
                     # If we, somehow, can keep track of what is where without needing to take another screenshot,
                     # then we don't actually need to capture this again once we know what it is and where it goes/went.
 
-                    # Valid names:
-                    # - i   (stands for ignore)
-                    # - bg  (stands for background)
-                    # - h_purple (for horizontal stripped purple candy) (v_* for vertical)
-                    # - l_purple (for locked purple candy)
-                    # - cherry
-                    # - nut
-                    # - ...
-                    
-                    new_things = {
-                        'i':   '?',
-                        'bg':       ' background',  # Intended white-space at the beginning
-                        'cherry':   'Cherry',       # Intended capital
-                        'nut':      'Nut',          # Intended capital
-                    }
-                    
-                    special_candy = '(l_)?([hv]_)?(purple|blue|green|yellow|red|orange)'
-
                     new_candy = None
                     while new_candy is None:
-                        new_candy = input("Unknown thingy detected!! What is it? ")
+                        new_candy_type = input("Unknown thingy detected!! What is it? ")
                         
-                        if new_candy in new_things:
-                            new_candy = new_things[new_candy]
-                        elif re.match(special_candy, new_candy) is None:
-                            print('Name not recognized... Try again!')
-                            new_candy = None
+                        try:
+                            new_candy = new_things[new_candy_type]
+                        except KeyError:
+                            if re.match(special_candy, new_candy_type):
+                                new_candy = new_candy_type
+                            else:
+                                print('Invalid candy type... Try again!')
 
                     grid[y][x] = Candy(new_candy, unknown_x, unknown_y, col, row)
 
-                    if new_candy != new_things['bg']:
+                    if new_candy != new_things['bg'] and new_candy != new_things['i']:
                         # Highlight the new candy if it isn't the background
-                        highlight_candies(screenshot, [grid[y][x]])
-                    
+                        highlight_candies(screenshot, [grid[y][x]], permanent_ink=True)
+
+                        cv2.imwrite(
+                            '{}/dynamic/{}.png'.format(CANDY_DIR, new_candy),
+
+                            # Easier to crop with PIL than this. :)
+                            blank_screenshot[unknown_y:unknown_y+h, unknown_x:unknown_x+w]
+                        )
                 else:
                     # show_screenshot(highlight_candies(screenshot.copy(), [candy]))
-                    show_screenshot(highlight_candies(screenshot, [candy]))
+                    show_screenshot(highlight_candies(screenshot, [candy], permanent_ink=True))
         
         print()
         print(grid)
 
-        # # screenshot = highlight_candies(screenshot, candies)  # Useless as screenshot as been modified in-place
+        # # screenshot = highlight_candies(screenshot, candies)  # Useless as screenshot has been modified in-place
         show_screenshot(screenshot)
         
         save('result.png', screenshot)
     else:
+        print('(Hit Ctrl+C to stop)')
+        print()
+
         try:
             while True:
                 try:
@@ -369,11 +424,37 @@ if __name__ == '__main__':
                     raise AllowedKeyboardInterrupt
                 
                 if candy:
-                    show_candies(screenshot, candy_book.get(candy, (candy, .7)))
+                    candies = catch_candy(
+                        screenshot,
+                        candy
+                        # candy_book.get(candy, (candy, .7))
+                    )
+                    
+                    print(list(candies))
+                    
+                    show_screenshot(
+                        highlight_candies(
+                            screenshot,
+                            candies
+                        )
+                    )
         except AllowedKeyboardInterrupt:
             print()
             print('Bye bye~')
         except KeyboardInterrupt:
             print()
-            print('ERROR: Script interrupted abruptely in the middle of a process! '
-                  'Not in between two stages. Did a step take too long to execute?')
+            print('ERROR: Script interrupted abruptly in the middle of a process! '
+                  '(Not in between two stages) Did a step take too long to execute?')
+
+    print()
+    input('Press Enter to close screenshot.')
+
+if __name__ == '__main__':
+    CANDY_DIR = 'candies/'
+
+    main(
+        candy_book,
+        take_screenshot=False,
+        catch_all=True,
+        use_extended_candybook=True
+    )
